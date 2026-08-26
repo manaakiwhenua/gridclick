@@ -1,3 +1,5 @@
+[![manaakiwhenua-standards](https://github.com/manaakiwhenua/gridclick/workflows/manaakiwhenua-standards/badge.svg)](https://github.com/manaakiwhenua/manaakiwhenua-standards)
+
 # <img src="gridclick/icon.svg" width="32" height="32" alt="Gridclick icon" align="top"> Gridclick — QGIS DGGS cell picker
 
 Left-click the map to create a feature representing the DGGS cell under the
@@ -91,3 +93,8 @@ split either.
 python -m pip install -r requirements.txt pytest
 python -m pytest tests/         # backend tests, no QGIS needed
 ```
+
+## License
+
+GPL-2.0-or-later — see [LICENSE](LICENSE). QGIS plugins must be released under
+a GPL-compatible license.
