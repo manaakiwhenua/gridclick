@@ -1,0 +1,8 @@
+# Install into the Python that QGIS uses, e.g. on Ubuntu:
+#   /usr/bin/python3 -m pip install --user -r requirements.txt
+# Each DGGS is optional; Gridclick enables whichever libraries import.
+h3>=4
+s2sphere
+pya5          # A5 — NOTE: the PyPI package named "a5" is unrelated
+pygeohash>=3
+rhealpixdggs  # 0.6.x needs Python >=3.11 / numpy<2; pip picks 0.5.x on Python 3.10

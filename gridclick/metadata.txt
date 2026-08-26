@@ -1,0 +1,13 @@
+[general]
+name=Gridclick
+qgisMinimumVersion=3.28
+description=Click the map to create DGGS cell features (rHEALPix, S2, H3, A5, Geohash). Hover shows the cell outline and centre; +/- move through the hierarchy.
+about=Gridclick adds a map tool that previews the DGGS cell under the cursor at the chosen resolution and creates a feature on click. Store the cell ID alone (string or int64), a point, a polygon, or a point+polygon geometry collection. Each target layer is locked to a single DGGS. Requires the Python packages listed in requirements.txt (h3, s2sphere, pya5, rhealpixdggs, pygeohash) — each DGGS is enabled independently depending on what is installed.
+version=0.1.0
+author=Richard Law (Bioeconomy Science Institute)
+email=lawr@landcareresearch.co.nz
+tags=dggs,h3,s2,a5,rhealpix,geohash,grid,digitizing
+category=Vector
+icon=icon.svg
+experimental=True
+hasProcessingProvider=no
