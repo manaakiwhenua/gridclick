@@ -6,8 +6,11 @@ from typing import Iterable, List, Optional, Tuple
 
 from qgis.core import (
     NULL,
+    QgsCategorizedSymbolRenderer,
     QgsCoordinateReferenceSystem,
+    QgsExpression,
     QgsFeature,
+    QgsFeatureRequest,
     QgsField,
     QgsFields,
     QgsFillSymbol,
@@ -24,6 +27,7 @@ from qgis.core import (
     QgsPointXY,
     QgsPolygon,
     QgsProject,
+    QgsRendererCategory,
     QgsVectorDataProvider,
     QgsVectorLayer,
     QgsWkbTypes,
@@ -31,6 +35,7 @@ from qgis.core import (
 from qgis.PyQt.QtCore import QVariant
 from qgis.PyQt.QtGui import QColor
 
+from . import presets as P
 from .backends import LABELS
 from .backends.base import CellInfo
 
@@ -47,9 +52,10 @@ MODE_LABELS = {
     COLLECTION: "Point + Polygon (geometry collection)",
 }
 
-# id formats
-ID_STR = "str"
-ID_INT = "int"
+# what a click does when the cell already has a feature in the layer
+ON_ADD = "add"        # append another feature (plain cell picking)
+ON_UPDATE = "update"  # rewrite its attributes (labelling: one feature per cell)
+ON_SKIP = "skip"      # leave it alone
 
 PROP_DGGS = "gridclick/dggs"
 PROP_MODE = "gridclick/mode"
@@ -124,16 +130,28 @@ def scratch_layer_name(backend_name: str, mode: str) -> str:
     return f"Gridclick {LABELS.get(backend_name, backend_name)} ({mode})"
 
 
-def create_scratch_layer(backend_name: str, mode: str) -> QgsVectorLayer:
+def create_scratch_layer(backend_name: str, mode: str, schema=None) -> QgsVectorLayer:
     uri = f"{_MEMORY_GEOM[mode]}?crs=EPSG:4326"
     layer = QgsVectorLayer(uri, scratch_layer_name(backend_name, mode), "memory")
-    layer.dataProvider().addAttributes(list(standard_fields()))
+    attrs = list(standard_fields()) + list(P.schema_fields(schema))
+    layer.dataProvider().addAttributes(attrs)
     layer.updateFields()
     layer.setCustomProperty(PROP_DGGS, backend_name)
     layer.setCustomProperty(PROP_MODE, mode)
-    style_scratch_layer(layer, backend_name, mode)
+    P.save_schema(layer, schema)
+    style_scratch_layer(layer, backend_name, mode, schema)
     QgsProject.instance().addMapLayer(layer)
     return layer
+
+
+def is_scratch_layer(layer) -> bool:
+    """True for layers Gridclick created itself — the only ones whose renderer
+    it may replace when the palette changes."""
+    return (
+        isinstance(layer, QgsVectorLayer)
+        and layer.providerType() == "memory"
+        and layer.name().startswith("Gridclick ")
+    )
 
 
 # one recognisable hue per DGGS so several scratch layers can coexist
@@ -170,19 +188,48 @@ def _outline_fill(colour: QColor) -> QgsFillSymbol:
     return fill
 
 
-def style_scratch_layer(layer: QgsVectorLayer, backend_name: str, mode: str) -> None:
-    """See-through default style: coloured outline + centre cross (polygon /
-    collection), coloured cross (point). ID-only layers have no geometry."""
-    colour = QColor(DGGS_COLOURS.get(backend_name, "#e65100"))
+def _symbol_for(mode: str, colour: QColor):
     if mode == POINT:
-        symbol = _centre_marker(colour, 3.0)
-    elif mode in (POLYGON, COLLECTION):
-        symbol = _outline_fill(colour)
-    else:
-        return
+        return _centre_marker(colour, 3.0)
+    if mode in (POLYGON, COLLECTION):
+        return _outline_fill(colour)
+    return None
+
+
+def categorized_renderer(schema, backend_name: str, mode: str):
+    """One category per label class, in its palette colour, plus a catch-all
+    in the DGGS colour so unlabelled cells still draw."""
+    cats = []
+    for preset in schema.presets:
+        sym = _symbol_for(mode, QColor(preset.colour))
+        if sym is None:
+            return None
+        cats.append(QgsRendererCategory(preset.name, sym, preset.name))
+    other = _symbol_for(mode, QColor(DGGS_COLOURS.get(backend_name, "#e65100")))
+    if other is None:
+        return None
+    # an invalid QVariant (NULL) is QGIS's "all other values" category
+    cats.append(QgsRendererCategory(NULL, other, "unlabelled"))
+    return QgsCategorizedSymbolRenderer(schema.label_field, cats)
+
+
+def style_scratch_layer(layer: QgsVectorLayer, backend_name: str, mode: str, schema=None) -> None:
+    """See-through default style: coloured outline + centre cross (polygon /
+    collection), coloured cross (point). ID-only layers have no geometry.
+    With a label schema the layer is categorised by class instead, so labels
+    are visible as they are laid down."""
     if layer.renderer() is None:
         # GeometryCollection layers have no renderer: QGIS cannot draw mixed
         # collections, so they are data-only (see README "Limitations").
+        return
+    if schema is not None and not schema.is_empty():
+        renderer = categorized_renderer(schema, backend_name, mode)
+        if renderer is not None:
+            layer.setRenderer(renderer)
+            layer.triggerRepaint()
+            return
+    symbol = _symbol_for(mode, QColor(DGGS_COLOURS.get(backend_name, "#e65100")))
+    if symbol is None:
         return
     layer.setRenderer(QgsSingleSymbolRenderer(symbol))
     layer.triggerRepaint()
@@ -258,8 +305,9 @@ def layer_mode(layer: QgsVectorLayer) -> Optional[str]:
     return str(tagged) if tagged else None
 
 
-def check_lock(layer: QgsVectorLayer, backend_name: str, mode: str) -> Tuple[bool, str]:
-    """(ok, reason). Refuses a write that would mix DGGSs or storage modes."""
+def check_lock(layer: QgsVectorLayer, backend_name: str, mode: str, schema=None) -> Tuple[bool, str]:
+    """(ok, reason). Refuses a write that would mix DGGSs or storage modes, or
+    that would silently drop label values the layer has no field for."""
     bound = layer_dggs(layer)
     if bound and bound != backend_name:
         return False, (
@@ -276,6 +324,12 @@ def check_lock(layer: QgsVectorLayer, backend_name: str, mode: str) -> Tuple[boo
         return False, f"Layer '{layer.name()}' geometry type does not match '{mode}'."
     if not layer_writable(layer):
         return False, f"Layer '{layer.name()}' does not accept new features."
+    missing = P.missing_fields(layer, schema)
+    if missing:
+        return False, (
+            f"Layer '{layer.name()}' has no field for {', '.join(missing)}; "
+            f"labels would be dropped."
+        )
     return True, ""
 
 
@@ -289,14 +343,34 @@ def bind_layer(layer: QgsVectorLayer, backend_name: str, mode: str) -> None:
 # --------------------------------------------------------------------------- #
 # features
 # --------------------------------------------------------------------------- #
-def _first_field_of_type(fields: QgsFields, types: Iterable[int]) -> int:
+def _first_field_of_type(fields: QgsFields, types: Iterable[int], exclude=()) -> int:
     for i, f in enumerate(fields):
-        if f.type() in types:
+        if f.type() in types and f.name() not in exclude:
             return i
     return -1
 
 
-def build_feature(layer: QgsVectorLayer, cell: CellInfo, mode: str, id_format: str) -> QgsFeature:
+def _label_fields(layer: QgsVectorLayer, schema=None) -> set:
+    """Names a label schema writes. The cell-id fallback below must not land
+    on one of these, or a click would overwrite its own label."""
+    schema = schema if schema is not None else P.load_schema(layer)
+    return set(schema.field_names()) if schema is not None else set()
+
+
+def _id_field_indexes(layer: QgsVectorLayer, schema=None):
+    """(string index, int index) for the cell id. Layers Gridclick made have
+    the standard fields; for a layer the user brought, fall back to its first
+    field of a usable type."""
+    fields = layer.fields()
+    i_str = fields.indexOf(F_ID)
+    i_int = fields.indexOf(F_ID_INT)
+    if i_str < 0 and i_int < 0:
+        i_str = _first_field_of_type(fields, (QVariant.String,), _label_fields(layer, schema))
+    return i_str, i_int
+
+
+def build_feature(layer: QgsVectorLayer, cell: CellInfo, mode: str,
+                  attrs=None) -> QgsFeature:
     fields = layer.fields()
     feat = QgsFeature(fields)
     geom = geometry_for(cell, mode)
@@ -316,32 +390,53 @@ def build_feature(layer: QgsVectorLayer, cell: CellInfo, mode: str, id_format: s
     setf(F_DGGS, cell.dggs)
     setf(F_RES, cell.resolution)
 
-    use_int = id_format == ID_INT and cell.id_int is not None
-    if use_int:
-        wrote = setf(F_ID_INT, signed_int64(cell.id_int))
-        if not wrote:
-            idx = _first_field_of_type(fields, (QVariant.LongLong, QVariant.ULongLong))
-            if idx >= 0:
-                feat.setAttribute(idx, signed_int64(cell.id_int))
-            else:
-                setf(F_ID, str(cell.id_int))
-    else:
-        wrote = setf(F_ID, cell.id_str)
-        if not wrote:
-            idx = _first_field_of_type(fields, (QVariant.String,))
-            if idx >= 0:
-                feat.setAttribute(idx, cell.id_str)
+    # Both spellings of the id are written. They are the same cell, the layer
+    # carries both columns anyway, and the string form stays authoritative for
+    # the DGGSs whose ids overflow int64.
+    reserved = set(attrs or {}) | _label_fields(layer)
+    if not setf(F_ID, cell.id_str):
+        # a layer of the user's own with no cell_id: fall back to a spare
+        # string field so the click still records something
+        idx = _first_field_of_type(fields, (QVariant.String,), reserved)
+        if idx >= 0:
+            feat.setAttribute(idx, cell.id_str)
+    if cell.id_int is not None:
+        # no fallback for the integer: writing it into whatever numeric column
+        # happened to be first would clobber unrelated data
+        setf(F_ID_INT, signed_int64(cell.id_int))
+
+    for name, value in (attrs or {}).items():
+        idx = fields.indexOf(name)
+        if idx >= 0:
+            feat.setAttribute(idx, P.coerce(value, fields[idx].type()))
     return feat
 
 
-def add_cell(layer: QgsVectorLayer, cell: CellInfo, mode: str, id_format: str) -> Tuple[bool, str]:
-    """Add a feature for `cell` to `layer`, honouring the DGGS lock.
+def add_cell(layer: QgsVectorLayer, cell: CellInfo, mode: str,
+             attrs=None, schema=None, on_existing: str = ON_ADD) -> Tuple[bool, str, str]:
+    """Write `cell` into `layer`, honouring the DGGS lock. Returns
+    (ok, reason, action) where action is "added", "updated" or "skipped".
+
+    `on_existing` decides what a repeat click does. Labelling uses ON_UPDATE so
+    a layer stays a clean cell -> class mapping and a misclick is corrected by
+    clicking again; plain cell picking uses ON_ADD.
     Starts an edit session if needed (memory layers are committed immediately)."""
-    ok, reason = check_lock(layer, cell.dggs, mode)
+    ok, reason = check_lock(layer, cell.dggs, mode, schema)
     if not ok:
-        return False, reason
+        return False, reason, ""
     bind_layer(layer, cell.dggs, mode)
-    feat = build_feature(layer, cell, mode, id_format)
+
+    if on_existing in (ON_UPDATE, ON_SKIP):
+        fids = find_cell_features(layer, cell)
+        if fids:
+            if on_existing == ON_SKIP:
+                return True, "", "skipped"
+            n, err = update_cell_attributes(layer, fids, attrs)
+            if err:
+                return False, err, ""
+            return True, "", "updated"
+
+    feat = build_feature(layer, cell, mode, attrs)
     if layer.isEditable():
         ok = layer.addFeature(feat)
     elif layer.providerType() == "memory":
@@ -349,30 +444,75 @@ def add_cell(layer: QgsVectorLayer, cell: CellInfo, mode: str, id_format: str) -
         layer.updateExtents()
     else:
         if not layer.startEditing():
-            return False, f"Could not start editing '{layer.name()}'."
+            return False, f"Could not start editing '{layer.name()}'.", ""
         ok = layer.addFeature(feat)
     if not ok:
-        return False, f"Failed to add feature to '{layer.name()}'."
+        return False, f"Failed to add feature to '{layer.name()}'.", ""
     layer.triggerRepaint()
-    return True, ""
+    return True, "", "added"
+
+
+def update_cell_attributes(layer: QgsVectorLayer, fids: List[int], attrs) -> Tuple[int, str]:
+    """Rewrite `attrs` on the given features. Returns (count, error)."""
+    if not attrs or not fids:
+        return 0, ""
+    if not layer.dataProvider().capabilities() & QgsVectorDataProvider.ChangeAttributeValues:
+        return 0, f"Layer '{layer.name()}' does not accept attribute changes."
+    fields = layer.fields()
+    changes = {}
+    for name, value in attrs.items():
+        idx = fields.indexOf(name)
+        if idx >= 0:
+            changes[idx] = P.coerce(value, fields[idx].type())
+    if not changes:
+        return 0, ""
+    if layer.providerType() == "memory" and not layer.isEditable():
+        ok = layer.dataProvider().changeAttributeValues({fid: dict(changes) for fid in fids})
+    else:
+        if not layer.isEditable() and not layer.startEditing():
+            return 0, f"Could not start editing '{layer.name()}'."
+        ok = all(
+            layer.changeAttributeValue(fid, idx, value)
+            for fid in fids
+            for idx, value in changes.items()
+        )
+    if not ok:
+        return 0, f"Failed to update features in '{layer.name()}'."
+    layer.triggerRepaint()
+    return len(fids), ""
 
 
 def find_cell_features(layer: QgsVectorLayer, cell: CellInfo) -> List[int]:
-    """Feature ids in `layer` that represent `cell` (by string or int id)."""
+    """Feature ids in `layer` that represent `cell` (by string or int id).
+
+    Expressed as a provider filter rather than a Python scan: relabelling looks
+    the cell up on every click, and a labelling layer runs to many thousands
+    of cells."""
     fields = layer.fields()
-    ids = []
-    i_str = fields.indexOf(F_ID)
-    i_int = fields.indexOf(F_ID_INT)
-    if i_str < 0 and i_int < 0:
-        i_str = _first_field_of_type(fields, (QVariant.String,))
-    sid = cell.id_str
-    iid = signed_int64(cell.id_int) if cell.id_int is not None else None
-    for feat in layer.getFeatures():
-        if i_str >= 0 and feat.attribute(i_str) not in (None, NULL) and str(feat.attribute(i_str)) == sid:
-            ids.append(feat.id())
-        elif i_int >= 0 and iid is not None and feat.attribute(i_int) not in (None, NULL) and int(feat.attribute(i_int)) == iid:
-            ids.append(feat.id())
-    return ids
+    i_str, i_int = _id_field_indexes(layer)
+    clauses, wanted = [], []
+    if i_str >= 0:
+        clauses.append(
+            f"{QgsExpression.quotedColumnRef(fields[i_str].name())} = "
+            f"{QgsExpression.quotedValue(cell.id_str)}"
+        )
+        wanted.append(i_str)
+    if i_int >= 0 and cell.id_int is not None:
+        # compared as text on purpose: QGIS evaluates a numeric comparison in
+        # an expression as a double, and S2/A5 ids are large enough that
+        # adjacent cells collapse onto the same double — which would delete or
+        # re-label the wrong cell. to_string() compares the int64 exactly.
+        clauses.append(
+            f"to_string({QgsExpression.quotedColumnRef(fields[i_int].name())}) = "
+            f"{QgsExpression.quotedValue(str(signed_int64(cell.id_int)))}"
+        )
+        wanted.append(i_int)
+    if not clauses:
+        return []
+    req = QgsFeatureRequest().setFilterExpression(" OR ".join(clauses))
+    req.setFlags(QgsFeatureRequest.NoGeometry)
+    req.setSubsetOfAttributes(wanted)
+    return [feat.id() for feat in layer.getFeatures(req)]
 
 
 def remove_cell(layer: QgsVectorLayer, cell: CellInfo) -> Tuple[int, str]:

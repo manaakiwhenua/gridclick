@@ -24,6 +24,9 @@ from . import layers as L
 
 _WGS84 = QgsCoordinateReferenceSystem("EPSG:4326")
 
+#: hover colour when no label class is in play
+PREVIEW_DEFAULT = QColor(255, 80, 0)
+
 
 class GridclickTool(QgsMapToolEmitPoint):
     #: emitted with a CellInfo (or None when the cursor leaves / lookup fails)
@@ -34,6 +37,10 @@ class GridclickTool(QgsMapToolEmitPoint):
     cellRightClicked = pyqtSignal(object)
     #: emitted with +1 / -1 when the user presses +/- or Ctrl+wheel
     resolutionStep = pyqtSignal(int)
+    #: emitted with a 0-based index when the user presses 1-9 (label class)
+    presetSelected = pyqtSignal(int)
+    #: emitted when the user presses 0 (move the hotkeys to the next nine)
+    presetPageNext = pyqtSignal()
 
     def __init__(self, canvas, resolution_provider: Callable[[], int]):
         super().__init__(canvas)
@@ -45,18 +52,45 @@ class GridclickTool(QgsMapToolEmitPoint):
         self._cell: Optional[CellInfo] = None
 
         self.band = QgsRubberBand(canvas, QgsWkbTypes.PolygonGeometry)
-        self.band.setStrokeColor(QColor(255, 80, 0, 220))
-        self.band.setFillColor(QColor(255, 80, 0, 40))
         self.band.setWidth(2)
 
         self.marker = QgsVertexMarker(canvas)
         self.marker.setIconType(QgsVertexMarker.ICON_CROSS)
-        self.marker.setColor(QColor(255, 80, 0, 255))
         self.marker.setIconSize(12)
         self.marker.setPenWidth(2)
         self.marker.hide()
 
+        self.preview_colour = QColor(PREVIEW_DEFAULT)
+        self.set_preview_colour(None)
+
         self.setCursor(Qt.CrossCursor)
+
+    # ------------------------------------------------------------------ #
+    def set_preview_colour(self, colour=None):
+        """Tint the hover preview with the class that a click would apply, so
+        the cell under the cursor already looks like what you are about to lay
+        down. `None` restores the neutral colour used when not labelling.
+
+        The class colour is used exactly, with a contrasting halo underneath
+        rather than being lightened or darkened — a preview that misreports the
+        colour would defeat the point."""
+        base = QColor(colour) if colour is not None else QColor(PREVIEW_DEFAULT)
+        if not base.isValid():
+            base = QColor(PREVIEW_DEFAULT)
+        self.preview_colour = base
+
+        stroke = QColor(base)
+        stroke.setAlpha(230)
+        fill = QColor(base)
+        fill.setAlpha(40)
+        halo = QColor(0, 0, 0, 90) if base.lightnessF() > 0.5 else QColor(255, 255, 255, 90)
+
+        self.band.setStrokeColor(stroke)
+        self.band.setFillColor(fill)
+        self.band.setSecondaryStrokeColor(halo)
+        self.marker.setColor(stroke)
+        self.band.update()
+        self.marker.update()
 
     # ------------------------------------------------------------------ #
     def set_backend(self, backend: Optional[DggsBackend]):
@@ -155,6 +189,12 @@ class GridclickTool(QgsMapToolEmitPoint):
             event.accept()
         elif key in (Qt.Key_Minus, Qt.Key_Underscore, Qt.Key_Down, Qt.Key_PageDown):
             self.resolutionStep.emit(-1)
+            event.accept()
+        elif Qt.Key_1 <= key <= Qt.Key_9:
+            self.presetSelected.emit(key - Qt.Key_1)
+            event.accept()
+        elif key == Qt.Key_0:
+            self.presetPageNext.emit()
             event.accept()
         else:
             super().keyPressEvent(event)

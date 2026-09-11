@@ -11,11 +11,13 @@ from qgis.PyQt.QtWidgets import (
     QComboBox,
     QDockWidget,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QMessageBox,
     QPushButton,
     QRadioButton,
+    QScrollArea,
     QSpinBox,
     QToolButton,
     QVBoxLayout,
@@ -24,7 +26,9 @@ from qgis.PyQt.QtWidgets import (
 
 from . import backends
 from . import layers as L
+from . import presets as P
 from .backends.base import CellInfo
+from .presetui import PalettePanel
 
 _SETTINGS = "gridclick/"
 SCRATCH = "__scratch__"
@@ -102,34 +106,36 @@ class GridclickDock(QDockWidget):
             mode_box.addWidget(rb)
         form.addRow("Store as", mode_box)
 
-        # id format
-        id_row = QHBoxLayout()
-        self.id_group = QButtonGroup(self)
-        self.id_str_rb = QRadioButton("String")
-        self.id_int_rb = QRadioButton("Integer (int64)")
-        self.id_group.addButton(self.id_str_rb)
-        self.id_group.addButton(self.id_int_rb)
-        id_row.addWidget(self.id_str_rb)
-        id_row.addWidget(self.id_int_rb)
-        form.addRow("Cell ID as", id_row)
-
         # target layer
         self.layer_combo = QComboBox()
         form.addRow("Target layer", self.layer_combo)
         self.binding_label = QLabel("")
         self.binding_label.setWordWrap(True)
         form.addRow("", self.binding_label)
+        self.fixfields_btn = QPushButton("Add the missing fields to this layer")
+        self.fixfields_btn.setVisible(False)
+        form.addRow("", self.fixfields_btn)
 
         root.addLayout(form)
 
+        # label palette
+        self.palette = PalettePanel()
+        group = QGroupBox("Labels")
+        gl = QVBoxLayout(group)
+        gl.setContentsMargins(6, 6, 6, 6)
+        gl.addWidget(self.palette)
+        root.addWidget(group, 1)      # takes the slack, so the table fills down
+
         # readout
-        self.readout = QLabel("Hover over the map…")
+        self.readout = QLabel("")
         self.readout.setWordWrap(True)
         self.readout.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.readout.setStyleSheet("font-family: monospace;")
         root.addWidget(self.readout)
-        root.addStretch(1)
-        self.setWidget(w)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(w)
+        self.setWidget(scroll)
 
     def _wire(self):
         self.activate_btn.toggled.connect(self.activateToggled)
@@ -138,8 +144,10 @@ class GridclickDock(QDockWidget):
         self.res_plus.clicked.connect(lambda: self.step_resolution(+1))
         self.res_minus.clicked.connect(lambda: self.step_resolution(-1))
         self.mode_group.buttonClicked.connect(self._on_mode_changed)
-        self.id_group.buttonClicked.connect(lambda _: self._save_and_emit())
         self.layer_combo.currentIndexChanged.connect(self._on_layer_changed)
+        self.palette.schemaChanged.connect(self._on_schema_changed)
+        self.palette.activeChanged.connect(self.settingsChanged)
+        self.fixfields_btn.clicked.connect(self._add_missing_fields)
         proj = QgsProject.instance()
         self._on_layers_changed = lambda _ids: self._refresh_layers()
         proj.layersAdded.connect(self._on_layers_changed)
@@ -164,16 +172,18 @@ class GridclickDock(QDockWidget):
         self._set_combo_data(self.dggs_combo, name)
         mode = s.value(_SETTINGS + "mode", L.POLYGON)
         self._mode_buttons.get(mode, self._mode_buttons[L.POLYGON]).setChecked(True)
-        idf = s.value(_SETTINGS + "id_format", L.ID_STR)
-        (self.id_int_rb if idf == L.ID_INT else self.id_str_rb).setChecked(True)
         self._pending_res = int(s.value(_SETTINGS + "res", 5))
+        schema = P.PresetSchema.from_json(s.value(_SETTINGS + "presets", ""))
+        labelling = str(s.value(_SETTINGS + "labelling", "false")).lower() == "true"
+        self.palette.set_schema(schema, enable=labelling)
 
     def _save_settings(self):
         s = QgsSettings()
         s.setValue(_SETTINGS + "dggs", self.backend_name())
         s.setValue(_SETTINGS + "mode", self.mode())
-        s.setValue(_SETTINGS + "id_format", self.id_format())
         s.setValue(_SETTINGS + "res", self.resolution())
+        s.setValue(_SETTINGS + "presets", self.palette.raw_schema().to_json())
+        s.setValue(_SETTINGS + "labelling", self.palette.enabled())
 
     def _save_and_emit(self):
         self._save_settings()
@@ -207,8 +217,36 @@ class GridclickDock(QDockWidget):
                 return mode
         return L.POLYGON
 
-    def id_format(self) -> str:
-        return L.ID_INT if self.id_int_rb.isChecked() else L.ID_STR
+    def schema(self):
+        """Active label schema, or None when labelling is off."""
+        return self.palette.schema()
+
+    def active_preset(self):
+        return self.palette.active_preset()
+
+    def click_attributes(self) -> dict:
+        """field -> value that the next click should write."""
+        return P.attributes_for(self.schema(), self.active_preset())
+
+    def on_existing(self) -> str:
+        """Labelling keeps one feature per cell, so a repeat click re-labels;
+        plain picking appends as before."""
+        return L.ON_UPDATE if self.schema() is not None else L.ON_ADD
+
+    def select_preset(self, index: int) -> bool:
+        """Select the class behind hotkey `index + 1` on the current page."""
+        return self.palette.select_hotkey(index)
+
+    def next_preset_page(self) -> bool:
+        """Point the 1-9 hotkeys at the next nine classes."""
+        return self.palette.next_page()
+
+    def effective_layer(self) -> Optional[QgsVectorLayer]:
+        """The layer a click would land in, if it already exists."""
+        layer = self.target_layer()
+        if layer is not None:
+            return layer
+        return L.find_scratch_layer(self.backend_name(), self.mode())
 
     def target_layer(self) -> Optional[QgsVectorLayer]:
         """None means 'use / create the scratch layer'."""
@@ -236,10 +274,6 @@ class GridclickDock(QDockWidget):
         self.res_spin.setValue(b.clamp(target))
         self.res_spin.blockSignals(False)
         self.res_range.setText(f"[{b.min_res}–{b.max_res}]")
-        self.id_int_rb.setEnabled(b.supports_int_id)
-        self.id_int_rb.setToolTip("" if b.supports_int_id else f"{b.label} has no integer cell IDs; string will be stored")
-        if not b.supports_int_id:
-            self.id_str_rb.setChecked(True)
 
     def step_resolution(self, delta: int):
         self.res_spin.setValue(self.res_spin.value() + delta)
@@ -291,6 +325,65 @@ class GridclickDock(QDockWidget):
                     "Gridclick", f"Switched DGGS to {backends.LABELS.get(bound, bound)} to match layer '{layer.name()}'."
                 )
                 self.backendChanged.emit(bound)
+            stored = P.load_schema(layer)
+            if stored is not None and not stored.is_empty():
+                # the schema belongs to the dataset: follow it, don't overwrite
+                self.palette.set_schema(stored, enable=True)
+                self._save_settings()
+                self.iface.messageBar().pushInfo(
+                    "Gridclick", f"Loaded label classes from '{layer.name()}'."
+                )
+        self._update_binding_label()
+        self.settingsChanged.emit()
+
+    def _on_schema_changed(self):
+        self._save_settings()
+        self.sync_scratch_schema()
+        self._update_binding_label()
+        self.settingsChanged.emit()
+
+    def sync_scratch_schema(self, layer: Optional[QgsVectorLayer] = None):
+        """Keep a Gridclick scratch layer in step with the palette: its fields,
+        its stored schema and its categorised style. Layers the user brought
+        are left alone — see `_add_missing_fields` for those."""
+        layer = layer if layer is not None else self.effective_layer()
+        if layer is None or not L.is_scratch_layer(layer):
+            return
+        schema = self.schema()
+        if schema is None:
+            # labelling switched off: stop writing labels, but leave the
+            # layer's stored palette and categorised style alone — the data
+            # it already holds still needs them to be readable
+            return
+        P.add_missing_fields(layer, schema)
+        P.save_schema(layer, schema)
+        L.style_scratch_layer(layer, self.backend_name(), self.mode(), schema)
+
+    def _add_missing_fields(self):
+        layer = self.target_layer()
+        schema = self.schema()
+        if layer is None or schema is None:
+            return
+        missing = P.missing_fields(layer, schema)
+        if not missing:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Gridclick — add fields",
+            f"Add the field(s) {', '.join(missing)} to layer '{layer.name()}'?\n\n"
+            "This changes the layer's structure.",
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        added, err = P.add_missing_fields(layer, schema)
+        if err:
+            self.iface.messageBar().pushWarning("Gridclick", err)
+        else:
+            self.iface.messageBar().pushInfo(
+                "Gridclick", f"Added {', '.join(added)} to '{layer.name()}'."
+            )
         self._update_binding_label()
         self.settingsChanged.emit()
 
@@ -315,13 +408,16 @@ class GridclickDock(QDockWidget):
     def _update_binding_label(self):
         layer = self.target_layer()
         name = backends.LABELS.get(self.backend_name(), self.backend_name())
+        schema = self.schema()
         if layer is None:
-            self.binding_label.setText(
-                f"→ scratch layer “{L.scratch_layer_name(self.backend_name(), self.mode())}” (one layer per DGGS)"
-            )
+            # targeting the scratch layer: the combo already says so
+            self.fixfields_btn.setVisible(False)
+            self.binding_label.setText("")
+            self.binding_label.setStyleSheet("")
             return
+        self.fixfields_btn.setVisible(bool(P.missing_fields(layer, schema)))
         bound = L.layer_dggs(layer)
-        ok, reason = L.check_lock(layer, self.backend_name(), self.mode())
+        ok, reason = L.check_lock(layer, self.backend_name(), self.mode(), schema)
         if ok:
             self.binding_label.setText(f"→ “{layer.name()}” [{backends.LABELS.get(bound, bound) if bound else 'unbound → ' + name}]")
             self.binding_label.setStyleSheet("")
@@ -332,7 +428,7 @@ class GridclickDock(QDockWidget):
     # ------------------------------------------------------------------ #
     def show_cell(self, cell: Optional[CellInfo]):
         if cell is None:
-            self.readout.setText("Hover over the map…")
+            self.readout.setText("")
             return
         try:
             area = self._area.measureArea(L.polygon_geometry(cell))
@@ -340,11 +436,13 @@ class GridclickDock(QDockWidget):
         except Exception:
             area_txt = "?"
         int_txt = f"\nint: {cell.id_int}" if cell.id_int is not None else ""
+        preset = self.active_preset()
+        label_txt = f"\nlabel: {preset.name}" if preset is not None else ""
         self.readout.setText(
             f"{backends.LABELS.get(cell.dggs, cell.dggs)} res {cell.resolution}\n"
             f"id:  {cell.id_str}{int_txt}\n"
             f"centre: {cell.centre[0]:.6f}, {cell.centre[1]:.6f}\n"
-            f"area ≈ {area_txt}"
+            f"area ≈ {area_txt}{label_txt}"
         )
 
     def set_active(self, active: bool):
