@@ -534,6 +534,6 @@ def remove_cell(layer: QgsVectorLayer, cell: CellInfo) -> Tuple[int, str]:
             return 0, f"Could not start editing '{layer.name()}'."
         ok = layer.deleteFeatures(fids)
     if not ok:
-        return 0, f"Failed to delete from '{layer.name()}'."
+        return 0, f"Could not remove the cell's features from '{layer.name()}'."
     layer.triggerRepaint()
     return len(fids), ""
