@@ -275,7 +275,7 @@ def compatible_layers(mode: str) -> List[QgsVectorLayer]:
     for layer in QgsProject.instance().mapLayers().values():
         if layer_writable(layer) and mode_geometry_ok(layer, mode):
             out.append(layer)
-    out.sort(key=lambda l: l.name().lower())
+    out.sort(key=lambda lyr: lyr.name().lower())
     return out
 
 
