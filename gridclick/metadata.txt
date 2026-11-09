@@ -6,6 +6,14 @@ about=Gridclick adds a map tool that previews the DGGS cell under the cursor at 
 version=0.2.0
 author=Richard Law (Bioeconomy Science Institute)
 email=lawr@landcareresearch.co.nz
+homepage=https://github.com/manaakiwhenua/gridclick
+repository=https://github.com/manaakiwhenua/gridclick
+tracker=https://github.com/manaakiwhenua/gridclick/issues
+changelog=0.2.0
+    - Class palette: one click also writes label attributes; keys 1-9 switch class
+    - Re-clicking a labelled cell re-labels it instead of duplicating it
+    0.1.0
+    - Initial release: H3, S2, A5, rHEALPix and Geohash cell picking with hover preview
 tags=dggs,h3,s2,a5,rhealpix,geohash,grid,digitizing,labelling,training data
 category=Vector
 icon=icon.svg

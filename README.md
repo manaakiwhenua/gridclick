@@ -39,7 +39,19 @@ Supported DGGSs: **H3, S2, A5, rHEALPix (WGS84, N_side 3), Geohash**.
 
 ## Install
 
+### From the QGIS plugin repository
+
 1. Install the DGGS libraries into QGIS's Python (each is optional):
+   ```sh
+   /usr/bin/python3 -m pip install --user h3 s2sphere pya5 pygeohash rhealpixdggs
+   ```
+   (See [requirements.txt](requirements.txt) for notes on versions.)
+2. Plugins ▸ Manage and Install ▸ Settings ▸ tick **Show also experimental
+   plugins**, then search for **Gridclick** and install it.
+
+### From source
+
+1. Install the DGGS libraries as above:
    ```sh
    /usr/bin/python3 -m pip install --user -r requirements.txt
    ```
@@ -189,6 +201,21 @@ QT_QPA_PLATFORM=offscreen python -m pytest tests/   # plus the QGIS ones
 The QGIS tests must run under the interpreter that carries the QGIS bindings
 (on Ubuntu, `/usr/bin/python3`). They run against a throwaway QGIS profile, so
 they cannot disturb your real settings.
+
+### Releasing
+
+1. Bump `version=` and add a `changelog` entry in
+   [gridclick/metadata.txt](gridclick/metadata.txt), commit, and tag
+   (`git tag v0.2.0`).
+2. Run `scripts/package.sh`. It packages the git-tracked files under
+   `gridclick/` from `HEAD`, copies `LICENSE` into the package (the plugin
+   repository requires it inside the zip) and writes
+   `dist/gridclick-<version>.zip`.
+3. Upload the zip at <https://plugins.qgis.org/plugins/add/> (first release)
+   or via *Add version* on the plugin's page (later releases). You need an
+   [OSGeo ID](https://id.osgeo.org/). The uploader checks that the
+   `repository`, `tracker` and `homepage` URLs in `metadata.txt` resolve, so
+   the GitHub repository must be public.
 
 ## License
 
